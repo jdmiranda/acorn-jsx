@@ -2,8 +2,30 @@
 
 const XHTMLEntities = require('./xhtml');
 
+// Pre-compiled regex patterns for performance
 const hexNumber = /^[\da-fA-F]+$/;
 const decimalNumber = /^\d+$/;
+
+// Character code constants for fast lookups
+const CHAR_CODE_LT = 60;      // '<'
+const CHAR_CODE_GT = 62;      // '>'
+const CHAR_CODE_LBRACE = 123; // '{'
+const CHAR_CODE_RBRACE = 125; // '}'
+const CHAR_CODE_AMP = 38;     // '&'
+const CHAR_CODE_QUOTE = 34;   // '"'
+const CHAR_CODE_APOS = 39;    // "'"
+const CHAR_CODE_DASH = 45;    // '-'
+const CHAR_CODE_CR = 13;      // '\r'
+const CHAR_CODE_LF = 10;      // '\n'
+const CHAR_CODE_SEMICOLON = 59; // ';'
+const CHAR_CODE_HASH = 35;    // '#'
+const CHAR_CODE_LOWERCASE_X = 120; // 'x'
+
+// Convert XHTML entities object to Map for faster lookups
+const XHTMLEntitiesMap = new Map(Object.entries(XHTMLEntities));
+
+// Cache for qualified JSX names
+const qualifiedNameCache = new WeakMap();
 
 // The map to `acorn-jsx` tokens from `acorn` namespace objects.
 const acornJsxMap = new WeakMap();
@@ -53,21 +75,34 @@ function getJsxTokens(acorn) {
   return acornJsx;
 }
 
-// Transforms JSX element name to string.
+// Transforms JSX element name to string with caching.
 
 function getQualifiedJSXName(object) {
   if (!object)
     return object;
 
-  if (object.type === 'JSXIdentifier')
-    return object.name;
+  // Check cache first
+  const cached = qualifiedNameCache.get(object);
+  if (cached !== undefined)
+    return cached;
 
-  if (object.type === 'JSXNamespacedName')
-    return object.namespace.name + ':' + object.name.name;
+  let result;
 
-  if (object.type === 'JSXMemberExpression')
-    return getQualifiedJSXName(object.object) + '.' +
-    getQualifiedJSXName(object.property);
+  if (object.type === 'JSXIdentifier') {
+    result = object.name;
+  } else if (object.type === 'JSXNamespacedName') {
+    result = object.namespace.name + ':' + object.name.name;
+  } else if (object.type === 'JSXMemberExpression') {
+    result = getQualifiedJSXName(object.object) + '.' +
+      getQualifiedJSXName(object.property);
+  }
+
+  // Cache the result
+  if (result !== undefined) {
+    qualifiedNameCache.set(object, result);
+  }
+
+  return result;
 }
 
 module.exports = function(options) {
@@ -109,7 +144,7 @@ function plugin(options, Parser) {
       return acornJsx;
     }
 
-    // Reads inline JSX contents token.
+    // Reads inline JSX contents token with optimized character code lookups.
     jsx_readToken() {
       let out = '', chunkStart = this.pos;
       for (;;) {
@@ -118,10 +153,10 @@ function plugin(options, Parser) {
         let ch = this.input.charCodeAt(this.pos);
 
         switch (ch) {
-        case 60: // '<'
-        case 123: // '{'
+        case CHAR_CODE_LT: // '<'
+        case CHAR_CODE_LBRACE: // '{'
           if (this.pos === this.start) {
-            if (ch === 60 && this.exprAllowed) {
+            if (ch === CHAR_CODE_LT && this.exprAllowed) {
               ++this.pos;
               return this.finishToken(tok.jsxTagStart);
             }
@@ -130,18 +165,18 @@ function plugin(options, Parser) {
           out += this.input.slice(chunkStart, this.pos);
           return this.finishToken(tok.jsxText, out);
 
-        case 38: // '&'
+        case CHAR_CODE_AMP: // '&'
           out += this.input.slice(chunkStart, this.pos);
           out += this.jsx_readEntity();
           chunkStart = this.pos;
           break;
 
-        case 62: // '>'
-        case 125: // '}'
+        case CHAR_CODE_GT: // '>'
+        case CHAR_CODE_RBRACE: // '}'
           this.raise(
             this.pos,
             "Unexpected token `" + this.input[this.pos] + "`. Did you mean `" +
-              (ch === 62 ? "&gt;" : "&rbrace;") + "` or " + "`{\"" + this.input[this.pos] + "\"}" + "`?"
+              (ch === CHAR_CODE_GT ? "&gt;" : "&rbrace;") + "` or " + "`{\"" + this.input[this.pos] + "\"}" + "`?"
           );
 
         default:
@@ -160,7 +195,7 @@ function plugin(options, Parser) {
       let ch = this.input.charCodeAt(this.pos);
       let out;
       ++this.pos;
-      if (ch === 13 && this.input.charCodeAt(this.pos) === 10) {
+      if (ch === CHAR_CODE_CR && this.input.charCodeAt(this.pos) === CHAR_CODE_LF) {
         ++this.pos;
         out = normalizeCRLF ? '\n' : '\r\n';
       } else {
@@ -181,7 +216,7 @@ function plugin(options, Parser) {
           this.raise(this.start, 'Unterminated string constant');
         let ch = this.input.charCodeAt(this.pos);
         if (ch === quote) break;
-        if (ch === 38) { // '&'
+        if (ch === CHAR_CODE_AMP) { // '&'
           out += this.input.slice(chunkStart, this.pos);
           out += this.jsx_readEntity();
           chunkStart = this.pos;
@@ -206,8 +241,9 @@ function plugin(options, Parser) {
       while (this.pos < this.input.length && count++ < 10) {
         ch = this.input[this.pos++];
         if (ch === ';') {
-          if (str[0] === '#') {
-            if (str[1] === 'x') {
+          const firstChar = str.charCodeAt(0);
+          if (firstChar === CHAR_CODE_HASH) {
+            if (str.charCodeAt(1) === CHAR_CODE_LOWERCASE_X) {
               str = str.substr(2);
               if (hexNumber.test(str))
                 entity = String.fromCharCode(parseInt(str, 16));
@@ -217,7 +253,8 @@ function plugin(options, Parser) {
                 entity = String.fromCharCode(parseInt(str, 10));
             }
           } else {
-            entity = XHTMLEntities[str];
+            // Use Map for faster entity lookup
+            entity = XHTMLEntitiesMap.get(str);
           }
           break;
         }
@@ -241,7 +278,7 @@ function plugin(options, Parser) {
       let ch, start = this.pos;
       do {
         ch = this.input.charCodeAt(++this.pos);
-      } while (isIdentifierChar(ch) || ch === 45); // '-'
+      } while (isIdentifierChar(ch) || ch === CHAR_CODE_DASH); // '-'
       return this.finishToken(tok.jsxName, this.input.slice(start, this.pos));
     }
 
@@ -453,16 +490,16 @@ function plugin(options, Parser) {
       if (context === tc_oTag || context === tc_cTag) {
         if (isIdentifierStart(code)) return this.jsx_readWord();
 
-        if (code == 62) {
+        if (code === CHAR_CODE_GT) {
           ++this.pos;
           return this.finishToken(tok.jsxTagEnd);
         }
 
-        if ((code === 34 || code === 39) && context == tc_oTag)
+        if ((code === CHAR_CODE_QUOTE || code === CHAR_CODE_APOS) && context === tc_oTag)
           return this.jsx_readString(code);
       }
 
-      if (code === 60 && this.exprAllowed && this.input.charCodeAt(this.pos + 1) !== 33) {
+      if (code === CHAR_CODE_LT && this.exprAllowed && this.input.charCodeAt(this.pos + 1) !== 33) {
         ++this.pos;
         return this.finishToken(tok.jsxTagStart);
       }
